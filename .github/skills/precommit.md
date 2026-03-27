@@ -28,17 +28,9 @@ If any check fails:
 
 ## GPG signing
 
-Before committing, check if GPG signing is required:
-
-```bash
-git config --get commit.gpgsign
-```
-
-If `commit.gpgsign` is `true`:
-
-- Attempt the commit normally (signing may work if the agent environment has keys configured).
-- If the commit fails due to GPG signing errors, **report the failure to the user**. Do not retry.
 - **NEVER** disable `gpgsign` — do not run `git config commit.gpgsign false` or pass `--no-gpg-sign`. This is a hard rule with no exceptions.
+- Do not proactively check signing configuration. Just attempt the commit.
+- If the commit fails due to a GPG/signing error, **report the failure to the user** and do not retry or work around it.
 
 ## Usage
 
