@@ -322,7 +322,7 @@ func newWorktreeFlow(cfg config.Config) error {
 		prNumStr := strings.TrimPrefix(hasPR, "PR #")
 		prNumStr = strings.SplitN(prNumStr, ":", 2)[0]
 		prNum := 0
-		fmt.Sscanf(prNumStr, "%d", &prNum)
+		fmt.Sscanf(prNumStr, "%d", &prNum) //nolint:errcheck
 
 		fmt.Fprintf(os.Stderr, "wt: fetching %s → %s\n", hasPR, dest)
 		if err := gitpkg.FetchPR(primaryWT, prRemote, prNum, selectedBranch); err != nil {
@@ -424,7 +424,6 @@ func ensureRepo(cfg config.Config, input string) (string, error) {
 		if err := os.Rename(cloneDest, newDest); err != nil {
 			return "", fmt.Errorf("rename failed: %w", err)
 		}
-		cloneDest = newDest
 	}
 
 	// Fork detection — only for github provider (gh CLI only works with GitHub)
