@@ -14,13 +14,13 @@
       {
         packages.default = pkgs.buildGoModule {
           pname = "wt";
-          version = "0.1.0";
+          version = "0.1.1";
           src = ./.;
           vendorHash = null;
 
           ldflags = [
             "-s" "-w"
-            "-X github.com/analogrelay/wt/cmd.Version=0.1.0"
+            "-X github.com/analogrelay/wt/cmd.Version=0.1.1"
           ];
 
           meta = with pkgs.lib; {
