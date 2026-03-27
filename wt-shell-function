@@ -1,0 +1,1003 @@
+# wt - worktree manager with tmux session integration
+#
+# Usage: wt [command] [args...]
+#
+# Commands:
+#   go [query]    Navigate to a project directory (formerly `goto`)
+#   status        Show health overview of all worktrees (default)
+#   sync          Safely pull/push all worktrees
+#   prune         Remove clean, in-sync worktrees
+#
+# The `go` subcommand navigates to ~/dev/[repo]/[worktree] directories
+# (and legacy ~/code/[owner]/[repo]), creating tmux sessions along the way.
+#
+# Synthetic fzf entries:
+#   [+] new worktree   — pick repo, branch, and optionally create new branch
+
+# ── helpers (defined once on first call, then globally available) ────────────
+
+if (( ! $+functions[_wt_session_name] )); then
+
+function _wt_log() {
+	echo "$@" 1>&2
+}
+
+function _wt_spin_start() {
+  local msg=${1:-"Working..."}
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  setopt local_options no_monitor
+  ( while true; do
+      for f in "${frames[@]}"; do
+        printf '\r%s %s' "$f" "$msg" >&2
+        sleep 0.08
+      done
+    done ) &
+  _wt_spin_pid=$!
+}
+
+function _wt_spin_stop() {
+  if [[ -n "$_wt_spin_pid" ]]; then
+    setopt local_options no_monitor
+    kill "$_wt_spin_pid" 2>/dev/null
+    wait "$_wt_spin_pid" 2>/dev/null
+    printf '\r\033[K' >&2
+    unset _wt_spin_pid
+  fi
+}
+
+function _wt_session_name() {
+  local dir=$1
+  local rel
+  if [[ "$dir" == "$HOME/dev/"* ]]; then
+    rel="${dir#$HOME/dev/}"
+    echo "${rel//\//_}"
+  elif [[ "$dir" == "$HOME/code/"* ]]; then
+    rel="${dir#$HOME/code/}"
+    echo "${rel//\//_}"
+  elif [[ "$dir" == "$HOME/.config/fleet" ]]; then
+    echo "fleet"
+  else
+    local parent base
+    parent="$(basename "$(dirname "$dir")")"
+    base="$(basename "$dir")"
+    local home_base
+    home_base="$(basename "$HOME")"
+    if [[ "$parent" == "$home_base" || "$parent" == "/" ]]; then
+      echo "$base"
+    else
+      echo "${parent}.${base}"
+    fi
+  fi
+}
+
+function _wt_switch() {
+  local target=$1
+  local session
+  session=$(_wt_session_name "$target")
+	_wt_log "using tmux session $session"
+
+  if [[ -n "$TMUX" ]]; then
+    if tmux has-session -t "=$session" 2>/dev/null; then
+			_wt_log "session $session found, switching..."
+      tmux switch-client -t "=$session"
+    else
+			_wt_log "session $session not found, creating..."
+      tmux new-session -d -s "$session" -c "$target"
+      tmux switch-client -t "=$session"
+    fi
+  else
+		_wt_log "session $session not found, starting tmux and creating..."
+    # Not in tmux — create or attach
+    tmux new-session -A -s "$session" -c "$target"
+  fi
+}
+
+function _wt_branch_to_dir() {
+  local branch=$1
+  echo "${branch//\//-}"
+}
+
+# Returns the path of the primary worktree (the one with a .git directory, not file)
+function _wt_primary_worktree() {
+  local repo_dir="$HOME/dev/$1"
+  [[ -d "$repo_dir" ]] || return 1
+  local wt
+  for wt in "$repo_dir"/*/; do
+    wt="${wt%/}"
+    [[ -d "$wt" ]] || continue
+    if [[ -d "$wt/.git" ]]; then
+      echo "$wt"
+      return 0
+    fi
+  done
+  # Fall back to any worktree (for linked-worktree-only setups)
+  local first
+  first=$(find "$repo_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+  [[ -n "$first" ]] && echo "$first"
+}
+
+# Parse git@github.com:owner/repo.git or https://github.com/owner/repo into owner/repo
+function _wt_remote_slug() {
+  echo "$1" | sed -E 's|.*[:/]([^/]+/[^/]+?)(\.git)?$|\1|'
+}
+
+# Returns "upstream" if that remote exists, otherwise "origin"
+function _wt_upstream_remote() {
+  local wt=$1
+  if git -C "$wt" remote get-url upstream &>/dev/null; then
+    echo "upstream"
+  else
+    echo "origin"
+  fi
+}
+
+# Returns the GitHub owner/repo slug for a given remote in a worktree
+function _wt_repo_slug() {
+  local wt=$1 remote=${2:-origin}
+  local url
+  url=$(git -C "$wt" remote get-url "$remote" 2>/dev/null) || return 1
+  _wt_remote_slug "$url"
+}
+
+# Returns running processes in a tmux session's panes
+function _wt_session_processes() {
+  local session=$1
+  tmux has-session -t "=$session" 2>/dev/null || return 1
+  local pane_pids
+  pane_pids=($(tmux list-panes -t "=$session" -F '#{pane_pid}' 2>/dev/null))
+  local pid cpid
+  for pid in "${pane_pids[@]}"; do
+    for cpid in $(pgrep -P "$pid" 2>/dev/null); do
+      local info
+      info=$(ps -p "$cpid" -o pid=,comm=,args= 2>/dev/null)
+      [[ -n "$info" ]] && echo "      ${info## }"
+    done
+  done
+}
+
+# ── go subcommand flows ─────────────────────────────────────────────────────
+
+# Clones a repo into ~/dev if not already present. Sets reply to the repo name.
+# Returns 0 if repo is ready, 1 if cancelled/failed.
+function _wt_ensure_repo() {
+  local input=$1
+
+  local slug
+  if [[ "$input" == *"github.com"* ]]; then
+    slug=$(_wt_remote_slug "$input")
+  elif [[ "$input" == *"/"* ]]; then
+    slug="${input%.git}"
+  else
+    echo "wt: expected owner/repo or GitHub URL" >&2
+    return 1
+  fi
+
+  local owner="${slug%/*}"
+  local repo="${slug#*/}"
+  local dest_name="$repo"
+  local dest_dir="$HOME/dev/$dest_name"
+
+  # Collision check — existing dir with a different remote
+  if [[ -d "$dest_dir" ]]; then
+    local existing_primary existing_remote
+    existing_primary=$(_wt_primary_worktree "$dest_name")
+    if [[ -n "$existing_primary" ]]; then
+      existing_remote=$(git -C "$existing_primary" remote get-url origin 2>/dev/null)
+    fi
+    if [[ "$(_wt_remote_slug "$existing_remote")" != "$slug" ]]; then
+      echo "wt: ~/dev/$dest_name already exists for a different repo."
+      echo -n "Use $owner.$repo instead? [y/N] "
+      local ans
+      read ans
+      if [[ "$ans" == [yY]* ]]; then
+        dest_name="$owner.$repo"
+        dest_dir="$HOME/dev/$dest_name"
+      else
+        return 1
+      fi
+    else
+      # Same repo, already cloned
+      reply="$dest_name"
+      return 0
+    fi
+  fi
+
+  local clone_url="git@github.com:${slug}.git"
+  echo "wt: cloning $slug → ~/dev/$dest_name/main ..."
+  git clone "$clone_url" "$HOME/dev/$dest_name/main" || return 1
+
+  # Detect default branch
+  local default_branch
+  default_branch=$(git -C "$HOME/dev/$dest_name/main" \
+    symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||')
+  [[ -z "$default_branch" ]] && default_branch="main"
+
+  # Rename clone dir to match default branch if needed
+  if [[ "$default_branch" != "main" ]]; then
+    mv "$HOME/dev/$dest_name/main" "$HOME/dev/$dest_name/$default_branch"
+  fi
+
+  # If the cloned repo is a fork, offer to add the parent as upstream
+  local primary_wt
+  primary_wt=$(_wt_primary_worktree "$dest_name")
+  local is_fork parent_slug
+  is_fork=$(gh repo view "$slug" --json isFork -q .isFork 2>/dev/null)
+  if [[ "$is_fork" == "true" ]]; then
+    parent_slug=$(gh repo view "$slug" --json parent -q '.parent.owner.login + "/" + .parent.name' 2>/dev/null)
+    if [[ -n "$parent_slug" ]]; then
+      echo "wt: $slug is a fork of $parent_slug"
+      echo -n "Add $parent_slug as 'upstream' remote? [Y/n] "
+      local ans
+      read ans
+      if [[ "$ans" != [nN]* ]]; then
+        local upstream_url="git@github.com:${parent_slug}.git"
+        git -C "$primary_wt" remote add upstream "$upstream_url"
+        git -C "$primary_wt" fetch upstream --quiet >/dev/null 2>&1
+        echo "wt: added upstream → $parent_slug"
+      fi
+    fi
+  fi
+
+  reply="$dest_name"
+  return 0
+}
+
+function _wt_new_flow() {
+  # ── Step 1: Repo picker ──────────────────────────────────────────────────
+
+  local repo_candidates=()
+  if [[ -d "$HOME/dev" ]]; then
+    local d
+    for d in "$HOME"/dev/*/; do
+      d="${d%/}"
+      [[ -d "$d" ]] && repo_candidates+=("$(basename "$d")")
+    done
+  fi
+
+  local fzf_out repo_selection
+  fzf_out=$(printf '%s\n' "${repo_candidates[@]}" \
+    | fzf --prompt="repo> " --print-query)
+  [[ -z "$fzf_out" ]] && return 1
+
+  repo_selection=$(echo "$fzf_out" | grep -v '^$' | tail -1)
+  [[ -z "$repo_selection" ]] && return 1
+
+  local repo
+  # Check if selection matches an existing repo directory
+  if [[ -d "$HOME/dev/$repo_selection" ]]; then
+    repo="$repo_selection"
+  else
+    # Not an existing repo — treat as owner/repo or URL, clone it
+    local reply
+    _wt_ensure_repo "$repo_selection" || return 1
+    repo="$reply"
+  fi
+
+  local primary_wt
+  primary_wt=$(_wt_primary_worktree "$repo")
+  if [[ -z "$primary_wt" ]]; then
+    echo "wt: cannot find primary worktree for $repo" >&2
+    return 1
+  fi
+
+  # ── Step 2: Branch picker ────────────────────────────────────────────────
+
+  _wt_spin_start "Collecting branches..."
+
+  # Fetch all remotes
+  git -C "$primary_wt" fetch --all --quiet >/dev/null 2>&1
+
+  # Collect branches from all sources, deduped with provenance
+  local -A branch_sources  # branch_name -> "local,origin,upstream"
+
+  # Local branches
+  local b
+  for b in $(git -C "$primary_wt" branch --format='%(refname:short)' 2>/dev/null); do
+    branch_sources[$b]="${branch_sources[$b]:+${branch_sources[$b]},}local"
+  done
+
+  # Remote branches
+  local ref remote_name branch_name
+  for ref in $(git -C "$primary_wt" branch -r --format='%(refname:short)' 2>/dev/null); do
+    # Skip HEAD pointers
+    [[ "$ref" == */HEAD ]] && continue
+    # Parse remote/branch
+    remote_name="${ref%%/*}"
+    branch_name="${ref#*/}"
+    branch_sources[$branch_name]="${branch_sources[$branch_name]:+${branch_sources[$branch_name]},}$remote_name"
+  done
+
+  # Open PRs
+  local -A branch_prs  # branch_name -> "PR #NNN: title"
+  local pr_remote pr_slug pr_list
+  pr_remote=$(_wt_upstream_remote "$primary_wt")
+  pr_slug=$(_wt_repo_slug "$primary_wt" "$pr_remote")
+  if [[ -n "$pr_slug" ]]; then
+    pr_list=$(gh pr list --repo "$pr_slug" --json number,title,headRefName \
+      --template '{{range .}}{{.number}}	{{.title}}	{{.headRefName}}{{"\n"}}{{end}}' 2>/dev/null)
+    local pr_line pr_num pr_title pr_branch
+    while IFS=$'\t' read -r pr_num pr_title pr_branch; do
+      [[ -z "$pr_num" ]] && continue
+      branch_prs[$pr_branch]="PR #${pr_num}: ${pr_title}"
+    done <<< "$pr_list"
+  fi
+
+  _wt_spin_stop
+
+  # Build display list: "branch_name    (provenance)"
+  local -a branch_display=()
+  local bname sources display_meta
+  for bname in "${(@ko)branch_sources}"; do
+    sources="${branch_sources[$bname]}"
+    display_meta="$sources"
+    if [[ -n "${branch_prs[$bname]}" ]]; then
+      display_meta+=", ${branch_prs[$bname]}"
+    fi
+    branch_display+=("$(printf '%-40s (%s)' "$bname" "$display_meta")")
+  done
+
+  # Add synthetic entry
+  branch_display+=("[+] new branch")
+
+  fzf_out=$(printf '%s\n' "${branch_display[@]}" \
+    | fzf --prompt="branch> " --print-query)
+  [[ -z "$fzf_out" ]] && return 1
+
+  local branch_selection
+  branch_selection=$(echo "$fzf_out" | grep -v '^$' | tail -1)
+  [[ -z "$branch_selection" ]] && return 1
+
+  # Parse the selection — extract branch name (strip trailing annotation)
+  local selected_branch selected_sources
+  if [[ "$branch_selection" == "[+] new branch" ]]; then
+    selected_branch=""
+  elif [[ "$branch_selection" == *'('*')' ]]; then
+    # Strip annotation: "branch_name     (sources)" → "branch_name"
+    selected_branch="${branch_selection%%  *}"
+    selected_branch="${selected_branch%% }"
+    selected_sources="${branch_sources[$selected_branch]}"
+  else
+    # Typed input (no match) — treat as new branch name
+    selected_branch="$branch_selection"
+    selected_branch="${selected_branch%% *}"
+    selected_sources=""
+  fi
+
+  # ── Step 3: New branch flow ──────────────────────────────────────────────
+
+  if [[ -z "$selected_branch" || -z "$selected_sources" ]]; then
+    local new_branch_name="$selected_branch"
+
+    # If came from [+] new branch, prompt for branch name
+    if [[ -z "$new_branch_name" ]]; then
+      echo -n "New branch name: "
+      read new_branch_name
+      [[ -z "$new_branch_name" ]] && return 1
+    fi
+
+    # Base branch picker — prioritize main/master/release/*
+    local -a base_candidates=()
+    local -a base_priority=()
+    local -a base_other=()
+    for bname in "${(@ko)branch_sources}"; do
+      case "$bname" in
+        main|master|release/*|release-*)
+          base_priority+=("$bname")
+          ;;
+        *)
+          base_other+=("$bname")
+          ;;
+      esac
+    done
+    base_candidates=("${base_priority[@]}" "${base_other[@]}")
+
+    local base_selection
+    base_selection=$(printf '%s\n' "${base_candidates[@]}" \
+      | fzf --prompt="base branch> " --print-query \
+      | grep -v '^$' | tail -1)
+    [[ -z "$base_selection" ]] && return 1
+
+    # Resolve the base to a ref (prefer remote tracking)
+    local base_ref="$base_selection"
+    if [[ -n "${branch_sources[$base_selection]}" ]]; then
+      local base_src="${branch_sources[$base_selection]}"
+      if [[ "$base_src" == *upstream* ]]; then
+        base_ref="upstream/$base_selection"
+      elif [[ "$base_src" == *origin* ]]; then
+        base_ref="origin/$base_selection"
+      fi
+    fi
+
+    local worktree_dir dest
+    worktree_dir=$(_wt_branch_to_dir "$new_branch_name")
+    dest="$HOME/dev/$repo/$worktree_dir"
+
+    if [[ -d "$dest" ]]; then
+      echo "wt: $dest already exists, switching to it"
+      _wt_switch "$dest"
+      return
+    fi
+
+    echo "wt: creating branch $new_branch_name from $base_selection"
+    git -C "$primary_wt" worktree add -b "$new_branch_name" "$dest" "$base_ref" || return 1
+    _wt_switch "$dest"
+    return
+  fi
+
+  # ── Create worktree for existing branch ────────────────────────────────
+
+  local worktree_dir dest
+  worktree_dir=$(_wt_branch_to_dir "$selected_branch")
+  dest="$HOME/dev/$repo/$worktree_dir"
+
+  if [[ -d "$dest" ]]; then
+    echo "wt: $dest already exists, switching to it"
+    _wt_switch "$dest"
+    return
+  fi
+
+  # Determine how to create the worktree based on provenance
+  local has_pr="${branch_prs[$selected_branch]}"
+
+  if [[ -n "$has_pr" && "$selected_sources" != *local* && "$selected_sources" != *origin* ]]; then
+    # PR from upstream only — fetch the PR ref
+    local pr_num_only="${has_pr#PR #}"
+    pr_num_only="${pr_num_only%%:*}"
+    echo "wt: fetching $has_pr → $dest"
+    git -C "$primary_wt" fetch "$pr_remote" "pull/${pr_num_only}/head:${selected_branch}" || return 1
+    git -C "$primary_wt" worktree add "$dest" "$selected_branch" || return 1
+  elif [[ "$selected_sources" == *upstream* && "$selected_sources" != *local* ]]; then
+    echo "wt: adding worktree for upstream branch $selected_branch"
+    git -C "$primary_wt" worktree add -b "$selected_branch" "$dest" "upstream/$selected_branch" || return 1
+  elif [[ "$selected_sources" == *origin* && "$selected_sources" != *local* ]]; then
+    echo "wt: adding worktree for origin/$selected_branch"
+    git -C "$primary_wt" worktree add "$dest" "origin/$selected_branch" || return 1
+  else
+    echo "wt: adding worktree for $selected_branch"
+    git -C "$primary_wt" worktree add "$dest" "$selected_branch" || return 1
+  fi
+
+  _wt_switch "$dest"
+}
+
+# ── go subcommand (formerly goto) ───────────────────────────────────────────
+
+function _wt_go() {
+  # Build directory candidates
+  local candidates=()
+
+  if [[ -d "$HOME/dev" ]]; then
+    local _dev_dirs
+    _dev_dirs=$(find "$HOME/dev" -mindepth 2 -maxdepth 2 -type d 2>/dev/null)
+    [[ -n "$_dev_dirs" ]] && candidates+=("${(f)_dev_dirs}")
+  fi
+
+  if [[ -d "$HOME/code" ]]; then
+    local _code_dirs
+    _code_dirs=$(find "$HOME/code" -mindepth 2 -maxdepth 2 -type d 2>/dev/null)
+    [[ -n "$_code_dirs" ]] && candidates+=("${(f)_code_dirs}")
+  fi
+
+  candidates+=(
+    "$HOME/.config/fleet"
+    "$HOME/dev"
+    "$HOME/code"
+  )
+
+  if [[ "$(uname)" == "Darwin" ]]; then
+    candidates+=("$HOME/Downloads" "$HOME/Desktop" "$HOME/Documents")
+  fi
+
+  # Annotate candidates with active tmux sessions
+  local _active_sessions=()
+  local _sess_list
+  _sess_list=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+  [[ -n "$_sess_list" ]] && _active_sessions=("${(f)_sess_list}")
+
+  local _display=()
+  local _c _sname
+  for _c in "${candidates[@]}"; do
+    _sname=$(_wt_session_name "$_c")
+    if (( ${_active_sessions[(Ie)$_sname]} )); then
+      _display+=("$_c [$_sname]")
+    else
+      _display+=("$_c")
+    fi
+  done
+
+  # Synthetic entries (not annotated)
+  _display+=("[+] new worktree")
+
+  # fzf
+  local _qry_args=()
+  if [[ -n "$1" ]]; then
+    _qry_args=(--query "$1" --select-1 --exit-0)
+  fi
+
+  local selected
+  selected=$(printf '%s\n' "${_display[@]}" | fzf "${_qry_args[@]}")
+  [[ $? -ne 0 || -z "$selected" ]] && return
+
+  # Strip session indicator suffix before dispatch
+  selected="${selected% \[*\]}"
+
+  # Dispatch
+  case "$selected" in
+    "[+] new worktree")
+      _wt_new_flow
+      ;;
+    *)
+      _wt_switch "$selected"
+      ;;
+  esac
+}
+
+# ── status subcommand ───────────────────────────────────────────────────────
+
+function _wt_status() {
+  if [[ ! -d "$HOME/dev" ]]; then
+    echo "wt: ~/dev does not exist" >&2
+    return 1
+  fi
+
+  # Collect active tmux sessions
+  local _active_sessions=()
+  local _sess_list
+  _sess_list=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+  [[ -n "$_sess_list" ]] && _active_sessions=("${(f)_sess_list}")
+
+  # First pass: collect rows and measure column widths
+  _wt_spin_start "Scanning worktrees..."
+  local -a _rows=()
+  local -a _claimed_sessions=()
+  local _w1=4 _w2=8 _w3=6 _w4=5 _w5=4  # minimum widths (header labels)
+
+  local d repo_name wt_name branch dirty_count dirty_str
+  local ahead behind sync_str session_str sname remote counts
+
+  # Collect all worktree directories (~/dev/*/* plus ~/.config/fleet)
+  local -a _wt_dirs=()
+  for d in "$HOME"/dev/*/*/; do
+    d="${d%/}"
+    [[ -d "$d" ]] && [[ -e "$d/.git" ]] && _wt_dirs+=("$d")
+  done
+  [[ -d "$HOME/.config/fleet/.git" ]] && _wt_dirs+=("$HOME/.config/fleet")
+
+  for d in "${_wt_dirs[@]}"; do
+    # Determine display names
+    if [[ "$d" == "$HOME/.config/fleet" ]]; then
+      repo_name="fleet"
+      wt_name="—"
+    else
+      repo_name="$(basename "$(dirname "$d")")"
+      wt_name="$(basename "$d")"
+    fi
+
+    # Branch
+    branch=$(git -C "$d" branch --show-current 2>/dev/null)
+    if [[ -z "$branch" ]]; then
+      branch="($(git -C "$d" rev-parse --short HEAD 2>/dev/null))"
+    fi
+
+    # Dirty check
+    dirty_count=$(git -C "$d" status --porcelain 2>/dev/null | wc -l)
+    dirty_count="${dirty_count## }"
+    if (( dirty_count == 0 )); then
+      dirty_str="✓"
+    else
+      dirty_str="✗ $dirty_count"
+    fi
+
+    # Sync check — fetch and compare with upstream tracking branch
+    remote=$(_wt_upstream_remote "$d")
+    git -C "$d" fetch "$remote" --quiet >/dev/null 2>&1
+
+    counts=$(git -C "$d" rev-list --left-right --count HEAD...@{upstream} 2>/dev/null)
+    if [[ -n "$counts" ]]; then
+      ahead="${counts%%$'\t'*}"
+      behind="${counts##*$'\t'}"
+      if (( ahead == 0 && behind == 0 )); then
+        sync_str="✓"
+      else
+        sync_str=""
+        (( ahead > 0 )) && sync_str+="↑$ahead"
+        (( behind > 0 )) && { [[ -n "$sync_str" ]] && sync_str+=" "; sync_str+="↓$behind"; }
+      fi
+    else
+      sync_str="—"
+    fi
+
+    # Tmux session — known sessions get a checkmark, no need to show the name
+    sname=$(_wt_session_name "$d")
+    if (( ${_active_sessions[(Ie)$sname]} )); then
+      session_str="●"
+      _claimed_sessions+=("$sname")
+    else
+      session_str="—"
+    fi
+
+    # Track max column widths
+    (( ${#repo_name} > _w1 )) && _w1=${#repo_name}
+    (( ${#wt_name} > _w2 )) && _w2=${#wt_name}
+    (( ${#branch} > _w3 )) && _w3=${#branch}
+    (( ${#dirty_str} > _w4 )) && _w4=${#dirty_str}
+    (( ${#sync_str} > _w5 )) && _w5=${#sync_str}
+
+    _rows+=("${repo_name}	${wt_name}	${branch}	${dirty_str}	${sync_str}	${session_str}")
+  done
+
+  # Add orphan tmux sessions (not associated with any worktree)
+  local _orphan_sess _orphan_label
+  for _orphan_sess in "${_active_sessions[@]}"; do
+    (( ${_claimed_sessions[(Ie)$_orphan_sess]} )) && continue
+    _orphan_label="< Unknown tmux session: $_orphan_sess >"
+    repo_name="$_orphan_label"
+    wt_name=""
+    branch="—"
+    dirty_str="—"
+    sync_str="—"
+    session_str="●"
+
+    (( ${#repo_name} > _w1 )) && _w1=${#repo_name}
+    _rows+=("${repo_name}	${wt_name}	${branch}	${dirty_str}	${sync_str}	${session_str}")
+  done
+  _wt_spin_stop
+
+  # Clamp column widths to terminal width
+  local _term_w=${COLUMNS:-80}
+  local _gap=6  # 2-space gaps between 4 pairs of columns, rounded
+  local _avail=$(( _term_w - _gap * 5 ))
+
+  # Truncate branch column if total exceeds terminal
+  local _total=$(( _w1 + _w2 + _w3 + _w4 + _w5 ))
+  if (( _total > _avail && _w3 > 12 )); then
+    _w3=$(( _avail - _w1 - _w2 - _w4 - _w5 ))
+    (( _w3 < 12 )) && _w3=12
+  fi
+
+  # Build format string
+  local _fmt="%-${_w1}s  %-${_w2}s  %-${_w3}s  %-${_w4}s  %-${_w5}s  %s\n"
+
+  # Print header
+  printf "$_fmt" "REPO" "WORKTREE" "BRANCH" "CLEAN" "SYNC" "SESSION"
+
+  local _sep1 _sep2 _sep3 _sep4 _sep5 _sep6
+  printf -v _sep1 '─%.0s' {1..$_w1}
+  printf -v _sep2 '─%.0s' {1..$_w2}
+  printf -v _sep3 '─%.0s' {1..$_w3}
+  printf -v _sep4 '─%.0s' {1..$_w4}
+  printf -v _sep5 '─%.0s' {1..$_w5}
+  _sep6="───────"
+  printf "$_fmt" "$_sep1" "$_sep2" "$_sep3" "$_sep4" "$_sep5" "$_sep6"
+
+  # Print rows
+  local _row _cols
+  for _row in "${_rows[@]}"; do
+    _cols=("${(@s:	:)_row}")
+    # Truncate branch if needed
+    local _br="${_cols[3]}"
+    if (( ${#_br} > _w3 )); then
+      _br="${_br[1,$((_w3-1))]}"
+      _br+="…"
+    fi
+    printf "$_fmt" "${_cols[1]}" "${_cols[2]}" "$_br" "${_cols[4]}" "${_cols[5]}" "${_cols[6]}"
+  done
+}
+
+# ── prune subcommand ────────────────────────────────────────────────────────
+
+function _wt_prune() {
+  if [[ ! -d "$HOME/dev" ]]; then
+    echo "wt: ~/dev does not exist" >&2
+    return 1
+  fi
+
+  # Collect active tmux sessions
+  local _active_sessions=()
+  local _sess_list
+  _sess_list=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+  [[ -n "$_sess_list" ]] && _active_sessions=("${(f)_sess_list}")
+
+  _wt_spin_start "Scanning worktrees..."
+
+  local prunable=()
+  local d repo_name wt_name dirty_count remote counts ahead behind
+
+  for d in "$HOME"/dev/*/*/; do
+    d="${d%/}"
+    [[ -d "$d" ]] || continue
+    [[ -e "$d/.git" ]] || continue
+
+    # Skip primary worktrees — has .git directory (not file)
+    [[ -d "$d/.git" ]] && continue
+
+    # Dirty check
+    dirty_count=$(git -C "$d" status --porcelain 2>/dev/null | wc -l)
+    dirty_count="${dirty_count## }"
+    (( dirty_count > 0 )) && continue
+
+    # Sync check
+    remote=$(_wt_upstream_remote "$d")
+    git -C "$d" fetch "$remote" --quiet >/dev/null 2>&1
+    counts=$(git -C "$d" rev-list --left-right --count HEAD...@{upstream} 2>/dev/null)
+    if [[ -n "$counts" ]]; then
+      ahead="${counts%%$'\t'*}"
+      behind="${counts##*$'\t'}"
+      (( ahead > 0 || behind > 0 )) && continue
+    else
+      # No tracking branch — can't verify sync, skip
+      continue
+    fi
+
+    prunable+=("$d")
+  done
+  _wt_spin_stop
+
+  if (( ${#prunable[@]} == 0 )); then
+    echo "wt: no worktrees eligible for pruning"
+    return 0
+  fi
+
+  echo ""
+  echo "The following worktrees are clean and in-sync:"
+  echo ""
+
+  local p sname branch
+  for p in "${prunable[@]}"; do
+    repo_name="$(basename "$(dirname "$p")")"
+    wt_name="$(basename "$p")"
+    branch=$(git -C "$p" branch --show-current 2>/dev/null)
+    [[ -z "$branch" ]] && branch="(detached)"
+
+    echo "  $repo_name/$wt_name  ($branch)"
+
+    # Show tmux session processes if active
+    sname=$(_wt_session_name "$p")
+    if (( ${_active_sessions[(Ie)$sname]} )); then
+      echo "    tmux session: $sname"
+      local procs
+      procs=$(_wt_session_processes "$sname")
+      if [[ -n "$procs" ]]; then
+        echo "    running processes:"
+        echo "$procs"
+      fi
+    fi
+  done
+
+  echo ""
+  echo -n "Remove these worktrees? [y/N] "
+  local ans
+  read ans
+  [[ "$ans" != [yY]* ]] && return 0
+
+  echo ""
+  local removed=0
+  for p in "${prunable[@]}"; do
+    repo_name="$(basename "$(dirname "$p")")"
+    wt_name="$(basename "$p")"
+    sname=$(_wt_session_name "$p")
+
+    # Kill tmux session if active
+    if (( ${_active_sessions[(Ie)$sname]} )); then
+      tmux kill-session -t "=$sname" 2>/dev/null
+      echo "wt: killed tmux session $sname"
+    fi
+
+    # Remove worktree from the primary worktree's context
+    local primary
+    primary=$(_wt_primary_worktree "$repo_name")
+    if [[ -n "$primary" ]] && git -C "$primary" worktree remove "$p" 2>/dev/null; then
+      echo "wt: removed $repo_name/$wt_name"
+      (( removed++ ))
+    else
+      echo "wt: failed to remove $repo_name/$wt_name" >&2
+    fi
+  done
+
+  echo ""
+  echo "wt: removed $removed worktree(s)"
+}
+
+# ── sync subcommand ─────────────────────────────────────────────────────────
+
+function _wt_sync() {
+  if [[ ! -d "$HOME/dev" ]]; then
+    echo "wt: ~/dev does not exist" >&2
+    return 1
+  fi
+
+  # ── Phase 1: Collect worktree directories ────────────────────────────────
+
+  local -a _wt_dirs=()
+  local d
+  for d in "$HOME"/dev/*/*/; do
+    d="${d%/}"
+    [[ -d "$d" ]] && [[ -e "$d/.git" ]] && _wt_dirs+=("$d")
+  done
+  [[ -d "$HOME/.config/fleet/.git" ]] && _wt_dirs+=("$HOME/.config/fleet")
+
+  if (( ${#_wt_dirs[@]} == 0 )); then
+    echo "wt: no worktrees found"
+    return 0
+  fi
+
+  # ── Phase 2: Fetch (once per repo) ──────────────────────────────────────
+
+  _wt_spin_start "Fetching remotes..."
+
+  local -A _fetched_repos=()
+  local repo_key primary_wt
+  for d in "${_wt_dirs[@]}"; do
+    if [[ "$d" == "$HOME/.config/fleet" ]]; then
+      repo_key="fleet"
+    else
+      repo_key="$(basename "$(dirname "$d")")"
+    fi
+
+    # Skip if already fetched this repo
+    [[ -n "${_fetched_repos[$repo_key]}" ]] && continue
+    _fetched_repos[$repo_key]=1
+
+    # Find the primary worktree for this repo to fetch from
+    if [[ "$d" == "$HOME/.config/fleet" ]]; then
+      git -C "$d" fetch --all --quiet >/dev/null 2>&1
+    else
+      primary_wt=$(_wt_primary_worktree "$repo_key")
+      if [[ -n "$primary_wt" ]]; then
+        git -C "$primary_wt" fetch --all --quiet >/dev/null 2>&1
+      fi
+    fi
+  done
+
+  _wt_spin_stop
+
+  # ── Phase 3: Analyze each worktree ──────────────────────────────────────
+
+  # Plan entries: action \t path \t label \t detail
+  # Actions: ok, pull, push, protect, diverge, dirty
+  local -a _plan=()
+  local repo_name wt_name label branch dirty_count
+  local remote counts ahead behind
+
+  for d in "${_wt_dirs[@]}"; do
+    if [[ "$d" == "$HOME/.config/fleet" ]]; then
+      repo_name="fleet"
+      wt_name="—"
+      label="fleet"
+    else
+      repo_name="$(basename "$(dirname "$d")")"
+      wt_name="$(basename "$d")"
+      label="$repo_name/$wt_name"
+    fi
+
+    # Branch
+    branch=$(git -C "$d" branch --show-current 2>/dev/null)
+    if [[ -z "$branch" ]]; then
+      continue
+    fi
+
+    # Dirty check
+    dirty_count=$(git -C "$d" status --porcelain 2>/dev/null | wc -l)
+    dirty_count="${dirty_count## }"
+    if (( dirty_count > 0 )); then
+      _plan+=("dirty	$d	$label	$dirty_count uncommitted changes")
+      continue
+    fi
+
+    # Sync check
+    remote=$(_wt_upstream_remote "$d")
+    counts=$(git -C "$d" rev-list --left-right --count HEAD...@{upstream} 2>/dev/null)
+    if [[ -z "$counts" ]]; then
+      continue
+    fi
+
+    ahead="${counts%%$'\t'*}"
+    behind="${counts##*$'\t'}"
+
+    if (( ahead == 0 && behind == 0 )); then
+      _plan+=("ok	$d	$label	in sync")
+    elif (( ahead == 0 && behind > 0 )); then
+      _plan+=("pull	$d	$label	$behind behind $remote")
+    elif (( ahead > 0 && behind == 0 )); then
+      case "$branch" in
+        main|master|release/*|release-*)
+          _plan+=("protect	$d	$label	$ahead ahead of $remote — push manually")
+          ;;
+        *)
+          _plan+=("push	$d	$label	$ahead ahead of $remote")
+          ;;
+      esac
+    else
+      _plan+=("diverge	$d	$label	$ahead ahead, $behind behind — needs manual rebase/merge")
+    fi
+  done
+
+  # ── Phase 4: Present sync plan ──────────────────────────────────────────
+
+  if (( ${#_plan[@]} == 0 )); then
+    echo "wt: no worktrees to sync"
+    return 0
+  fi
+
+  local has_actions=false
+  local entry action epath elabel detail
+
+  echo ""
+  echo "wt sync plan:"
+  echo ""
+  for entry in "${_plan[@]}"; do
+    action="${entry%%	*}"
+    local rest="${entry#*	}"
+    epath="${rest%%	*}"
+    rest="${rest#*	}"
+    elabel="${rest%%	*}"
+    detail="${rest#*	}"
+
+    case "$action" in
+      ok)      printf "  ✓ ok      %-35s (%s)\n" "$elabel" "$detail" ;;
+      pull)    printf "  ↓ pull    %-35s (%s)\n" "$elabel" "$detail"; has_actions=true ;;
+      push)    printf "  ↑ push    %-35s (%s)\n" "$elabel" "$detail"; has_actions=true ;;
+      protect) printf "  ⚠ protect %-35s (%s)\n" "$elabel" "$detail" ;;
+      diverge) printf "  ⚠ diverge %-35s (%s)\n" "$elabel" "$detail" ;;
+      dirty)   printf "  ⚠ dirty   %-35s (%s)\n" "$elabel" "$detail" ;;
+    esac
+  done
+
+  if [[ "$has_actions" != true ]]; then
+    echo ""
+    echo "wt: nothing to sync"
+    return 0
+  fi
+
+  echo ""
+  echo -n "Proceed with pull/push actions? [y/N] "
+  local ans
+  read ans
+  [[ "$ans" != [yY]* ]] && return 0
+
+  # ── Phase 5: Execute ────────────────────────────────────────────────────
+
+  echo ""
+  for entry in "${_plan[@]}"; do
+    action="${entry%%	*}"
+    local rest="${entry#*	}"
+    epath="${rest%%	*}"
+    rest="${rest#*	}"
+    elabel="${rest%%	*}"
+
+    case "$action" in
+      pull)
+        if git -C "$epath" pull --ff-only --quiet 2>/dev/null; then
+          echo "  ✓ pulled  $elabel"
+        else
+          echo "  ✗ failed  $elabel (pull --ff-only failed)" >&2
+        fi
+        ;;
+      push)
+        if git -C "$epath" push --quiet 2>/dev/null; then
+          echo "  ✓ pushed  $elabel"
+        else
+          echo "  ✗ failed  $elabel (push failed)" >&2
+        fi
+        ;;
+    esac
+  done
+
+  echo ""
+  echo "wt: sync complete"
+}
+
+fi  # end of one-time function definitions
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+local cmd=${1:-status}
+shift 2>/dev/null
+
+case "$cmd" in
+  go)     _wt_go "$@" ;;
+  status) _wt_status "$@" ;;
+  sync)   _wt_sync "$@" ;;
+  prune)  _wt_prune "$@" ;;
+  *)      echo "wt: unknown command: $cmd" >&2; return 1 ;;
+esac
